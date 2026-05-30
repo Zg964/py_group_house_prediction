@@ -1,6 +1,6 @@
 """
-上海房价预测 —— Codabench 提交脚本
-====================================
+上海房价预测 —— Codabench 提交脚本 (Phase 2)
+==============================================
 用法: python3 predict.py --train train.csv --test test.csv --output predictions.csv
 
 流程:
@@ -10,25 +10,35 @@
   4. 对测试集进行预测并还原为总价
   5. 输出 predictions.csv（包含 Id 和 house_price 两列）
 
-模型: RandomForestRegressor（目标为 log(价格/面积)，还原总价）
-      备用: 支持加载预训练 model.pkl（若存在）
+模型: 优先加载预训练 model.pkl / model_stacking.pkl
+      若无预训练模型则训练 RandomForestRegressor
 
-依赖: pandas, numpy, scikit-learn（均为 Codabench 环境已有库）
+依赖: pandas, numpy, scikit-learn, xgboost (可选)
 """
 
 import argparse
 import os
 import warnings
+warnings.filterwarnings("ignore")
+
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import OneHotEncoder
+from copy import deepcopy
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder
+import joblib
 
 warnings.filterwarnings("ignore")
 
+RANDOM_STATE = 42
+PPS_LOWER_PERCENTILE = 0.5
+PPS_UPPER_PERCENTILE = 99.5
+AREA_LOWER_PERCENTILE = 0.5
+AREA_UPPER_PERCENTILE = 99.5
 
 # ============================================================
-# 1. 特征工程函数
+# 1. 特征工程函数（与 train_model.py 保持同步）
 # ============================================================
 
 def _clean_district(df: pd.DataFrame) -> pd.DataFrame:
@@ -40,13 +50,10 @@ def _clean_district(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _extract_title_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    从 title 字段提取关键词特征（18 个关键词）。
-    """
+    """从 title 字段提取关键词特征（18 个关键词）。"""
     title_series = df["title"].fillna("").astype(str).str.lower()
 
     keywords = {
-        # 原有 9 个
         "has_subway": "地铁",
         "has_decorated": "精装|豪装",
         "has_elevator": "电梯",
@@ -56,7 +63,6 @@ def _extract_title_features(df: pd.DataFrame) -> pd.DataFrame:
         "has_garden": "花园|景观",
         "has_quiet": "安静|不临街",
         "has_corner": "边套|全明",
-        # 新增 9 个
         "has_luxury": "豪华装修",
         "has_simple": "简单装修",
         "has_lianjia": "链家好房",
@@ -77,22 +83,16 @@ def _extract_title_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _extract_orientation_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    从 orientation 字段提取朝向分组特征（5 组）。
-    朝向价值: 南北 > 南 > 东西 > 北 > 未知
-    """
+    """从 orientation 字段提取朝向分组特征（5 组）。"""
     ori_series = df["orientation"].fillna("").astype(str).str.lower()
 
     result = pd.DataFrame(index=df.index)
-    # 朝南北（含南+北、南北通透）
     result["ori_south_north"] = (
         ori_series.str.contains("南") & ori_series.str.contains("北")
     ).astype(int)
-    # 朝南（仅有南，不含南北）
     result["ori_south"] = (
         ori_series.str.contains("南") & ~ori_series.str.contains("北")
     ).astype(int)
-    # 朝东西（含东、西、东南、西南等，不含南/北）
     result["ori_east_west"] = (
         ~ori_series.str.contains("南")
         & ~ori_series.str.contains("北")
@@ -100,11 +100,9 @@ def _extract_orientation_features(df: pd.DataFrame) -> pd.DataFrame:
            | ori_series.str.contains("东南") | ori_series.str.contains("西南")
            | ori_series.str.contains("东北") | ori_series.str.contains("西北"))
     ).astype(int)
-    # 朝北（仅有北，不含南）
     result["ori_north"] = (
         ori_series.str.contains("北") & ~ori_series.str.contains("南")
     ).astype(int)
-    # 未知（含"进门X"、缺失等）
     result["ori_unknown"] = (
         (ori_series == "") | ori_series.isna()
         | ori_series.str.contains("进门", na=False)
@@ -117,9 +115,7 @@ def _extract_orientation_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _compute_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    计算比例和派生数值特征。
-    """
+    """计算比例和派生数值特征（含 log 变换）。"""
     result = pd.DataFrame(index=df.index)
 
     bedrooms = pd.to_numeric(df["bedrooms"], errors="coerce").fillna(2)
@@ -132,7 +128,6 @@ def _compute_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
     )
     build_year = pd.to_numeric(df["build_year"], errors="coerce").fillna(2000)
 
-    # 原有特征
     result["total_rooms"] = bedrooms + livingrooms
     result["rooms_per_sqm"] = (bedrooms + livingrooms) / (area + 1e-6)
     result["area_per_room"] = area / (bedrooms + livingrooms + 1e-6)
@@ -149,11 +144,8 @@ def _compute_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
         total_floor + 1
     )
 
-    # 新增: 每卧室面积
     result["area_per_bedroom"] = area / (bedrooms + 1e-6)
 
-    # 新增: total_floor 分桶与 floor_ratio 交互
-    # low-rise: 1-6, mid-rise: 7-18, high-rise: 19+
     floor_bucket = pd.cut(
         total_floor,
         bins=[0, 6, 18, 200],
@@ -162,16 +154,18 @@ def _compute_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
     result["floor_bucket_low"] = (floor_bucket == "low_rise").astype(int)
     result["floor_bucket_mid"] = (floor_bucket == "mid_rise").astype(int)
     result["floor_bucket_high"] = (floor_bucket == "high_rise").astype(int)
-    # floor_ratio * total_floor 交互
     result["floor_ratio_x_total"] = result["floor_height_ratio"] * total_floor
+
+    # ---- Log 变换特征 ----
+    result["log_area_sqm"] = np.log(area + 1e-6)
+    result["log_total_rooms"] = np.log(result["total_rooms"] + 1e-6)
+    result["log_area_per_bedroom"] = np.log(result["area_per_bedroom"] + 1e-6)
 
     return result
 
 
 def _detect_villa(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    识别别墅: floor_region 缺失 且 总楼层 <= 3
-    """
+    """识别别墅: floor_region 缺失 且 总楼层 <= 3"""
     floor_region_missing = df["floor_region"].isna()
     total_floor_low = pd.to_numeric(df["total_floor"], errors="coerce").fillna(99) <= 3
     return pd.DataFrame({
@@ -180,9 +174,7 @@ def _detect_villa(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _bucket_build_year(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    build_year 分桶: pre-1950, 1950-1990, 1990-2000, 2000-2010, 2010+, unknown
-    """
+    """build_year 分桶: pre-1950, 1950-1990, 1990-2000, 2000-2010, 2010+, unknown"""
     by = pd.to_numeric(df["build_year"], errors="coerce")
 
     result = pd.DataFrame(index=df.index)
@@ -196,7 +188,7 @@ def _bucket_build_year(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _frequency_encode(train: pd.DataFrame, test: pd.DataFrame, col: str) -> tuple:
-    """频率编码: 用类别在训练集中的出现频次替代原始值"""
+    """频率编码"""
     freq = train[col].value_counts().to_dict()
     train_enc = train[col].map(freq).fillna(1)
     test_enc = test[col].map(freq).fillna(1)
@@ -205,18 +197,40 @@ def _frequency_encode(train: pd.DataFrame, test: pd.DataFrame, col: str) -> tupl
 
 def _target_encode(train: pd.DataFrame, test: pd.DataFrame,
                    col: str, target: pd.Series, smooth: int = 1) -> tuple:
-    """
-    目标编码: 用类别的目标均值替代原始值，加入全局平滑避免过拟合。
-    smooth: 平滑系数，越大越保守
-    """
+    """目标编码（含平滑）"""
     global_mean = target.mean()
     agg = train.groupby(col)[target.name].agg(["mean", "count"])
     smoothed = (agg["mean"] * agg["count"] + global_mean * smooth) / (agg["count"] + smooth)
     encoding_map = smoothed.to_dict()
-
     train_enc = train[col].map(encoding_map).fillna(global_mean)
     test_enc = test[col].map(encoding_map).fillna(global_mean)
     return train_enc.values, test_enc.values
+
+
+def _get_interaction_features(df_train, df_test):
+    """计算交互特征: district_rooms, by_district"""
+    # district × total_rooms
+    le_d = LabelEncoder()
+    district_all = pd.concat([
+        df_train["district"].astype(str).str.strip().str.replace("二手房", "", regex=False),
+        df_test["district"].astype(str).str.strip().str.replace("二手房", "", regex=False),
+    ])
+    le_d.fit(district_all)
+
+    for df, name in [(df_train, "train"), (df_test, "test")]:
+        bedrooms = pd.to_numeric(df["bedrooms"], errors="coerce").fillna(2)
+        livingrooms = pd.to_numeric(df["livingrooms"], errors="coerce").fillna(1)
+        total_rooms = bedrooms + livingrooms
+        district_clean = df["district"].astype(str).str.strip().str.replace("二手房", "", regex=False)
+        district_num = le_d.transform(district_clean)
+        if name == "train":
+            train_dr = district_num * total_rooms
+            train_by = district_num * pd.to_numeric(df["build_year"], errors="coerce").fillna(2000)
+        else:
+            test_dr = district_num * total_rooms
+            test_by = district_num * pd.to_numeric(df["build_year"], errors="coerce").fillna(2000)
+
+    return (train_dr.values, train_by.values), (test_dr.values, test_by.values)
 
 
 # ============================================================
@@ -255,6 +269,16 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
         print(f"[INFO] 删除 {suspicious.sum()} 条可疑记录 (bedrooms==1 & area_sqm>200)")
         train_df = train_df[~suspicious].reset_index(drop=True)
 
+    # 3. area_sqm winsorization
+    area_train = pd.to_numeric(train_df["area_sqm"], errors="coerce")
+    area_lower = np.percentile(area_train.dropna(), AREA_LOWER_PERCENTILE)
+    area_upper = np.percentile(area_train.dropna(), AREA_UPPER_PERCENTILE)
+    train_df["area_sqm"] = np.clip(area_train, area_lower, area_upper)
+    test_df["area_sqm"] = np.clip(
+        pd.to_numeric(test_df["area_sqm"], errors="coerce"), area_lower, area_upper
+    )
+    test_area = np.clip(test_area, area_lower, area_upper)
+
     # ================================================================
     # 计算 PPS 目标变量
     # ================================================================
@@ -262,14 +286,14 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
         pd.to_numeric(train_df["house_price"], errors="coerce")
         / pd.to_numeric(train_df["area_sqm"], errors="coerce")
     )
-    # 裁剪 99.5% 分位后取 log
-    pps_cap = np.percentile(train_pps, 99.5)
-    train_pps_clipped = np.clip(train_pps, None, pps_cap)
+    # 双侧裁剪
+    pps_lower = np.percentile(train_pps, PPS_LOWER_PERCENTILE)
+    pps_upper = np.percentile(train_pps, PPS_UPPER_PERCENTILE)
+    train_pps_clipped = np.clip(train_pps, pps_lower, pps_upper)
     train_log_pps = np.log(train_pps_clipped)
-    # 将 log(PPS) 加入 DataFrame，供目标编码使用
     train_df["log_pps"] = train_log_pps
     target_series = train_df["log_pps"]
-    print(f"[INFO] PPS 目标: 裁剪上限={pps_cap:.2f}, log(PPS) 偏度={train_log_pps.std():.4f}")
+    print(f"[INFO] PPS 目标: 裁剪范围=[{pps_lower:.2f}, {pps_upper:.2f}]")
 
     # ================================================================
     # 特征工程
@@ -292,7 +316,7 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
     ori_train = _extract_orientation_features(train_df)
     ori_test = _extract_orientation_features(test_df)
 
-    # --- 数值比例特征 ---
+    # --- 数值比例特征（含 log 变换）---
     ratio_train = _compute_ratio_features(train_df)
     ratio_test = _compute_ratio_features(test_df)
 
@@ -304,17 +328,20 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
         train_df, test_df, "subdistrict"
     )
 
-    # --- district 目标编码（使用 log(PPS)）---
-    district_train, district_test = _target_encode(
+    # --- district 目标编码 ---
+    district_train_enc, district_test_enc = _target_encode(
         train_df, test_df, "district", target_series, smooth=1
     )
 
-    # --- subdistrict 目标编码（使用 log(PPS)，提高平滑系数 count+10）---
+    # --- subdistrict 目标编码 ---
     subdistrict_target_train, subdistrict_target_test = _target_encode(
         train_df, test_df, "subdistrict", target_series, smooth=10
     )
 
-    # --- floor_region 原始值保留给 OneHot ---
+    # --- 交互特征 ---
+    (train_dr, train_by), (test_dr, test_by) = _get_interaction_features(train_df, test_df)
+
+    # --- floor_region OneHot ---
     floor_region_train = train_df["floor_region"].fillna("未知").astype(str)
     floor_region_test = test_df["floor_region"].fillna("未知").astype(str)
 
@@ -342,8 +369,10 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
             villa_train.values,
             community_train,
             subdistrict_train,
-            district_train,
+            district_train_enc,
             subdistrict_target_train,
+            train_dr,
+            train_by,
         ]
     )
 
@@ -357,12 +386,14 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
             villa_test.values,
             community_test,
             subdistrict_test,
-            district_test,
+            district_test_enc,
             subdistrict_target_test,
+            test_dr,
+            test_by,
         ]
     )
 
-    # --- floor_region OneHot 编码 ---
+    # floor_region OneHot
     all_floor = pd.concat(
         [floor_region_train, floor_region_test], axis=0
     ).unique()
@@ -381,24 +412,94 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
     # ================================================================
     # 优先尝试加载预训练模型，否则重新训练
     # ================================================================
+    model = None
+
+    # 尝试加载 stacking 模型
+    stacking_path = "model_stacking.pkl"
+    if os.path.exists(stacking_path):
+        print(f"[INFO] 加载预训练 Stacking 模型: {stacking_path}")
+        try:
+            stacked = joblib.load(stacking_path)
+            if isinstance(stacked, dict) and stacked.get("type") == "stacking":
+                # Stacking 模型: 用 base models 预测，meta-learner 整合
+                base_models = stacked["base_models"]
+                meta_learner = stacked["meta_learner"]
+                model_names = stacked["model_names"]
+                print(f"[INFO] Stacking 模型加载成功: base={model_names}")
+
+                all_preds = np.column_stack([m.predict(X_train) for m_name, m in base_models.items()])
+                print(f"[INFO] Stacking meta features shape: {all_preds.shape}")
+
+                # 定义 predict 函数闭包
+                class StackingWrapper:
+                    def __init__(self, base_models, meta_learner, model_names):
+                        self.base_models = base_models
+                        self.meta_learner = meta_learner
+                        self.model_names = model_names
+
+                    def predict(self, X):
+                        meta_feats = np.column_stack([
+                            m.predict(X) for m_name, m in self.base_models.items()
+                        ])
+                        return self.meta_learner.predict(meta_feats)
+
+                model = StackingWrapper(base_models, meta_learner, model_names)
+            else:
+                print(f"[INFO] model_stacking.pkl 格式不匹配，尝试 model.pkl")
+        except Exception as e:
+            print(f"[INFO] 加载 stacking 模型失败 ({e})，尝试 model.pkl")
+
+    # 尝试加载单模型
     model_path = "model.pkl"
-    if os.path.exists(model_path):
+    if model is None and os.path.exists(model_path):
         print(f"[INFO] 加载预训练模型: {model_path}")
-        import joblib
-        model = joblib.load(model_path)
-    else:
-        print("[INFO] 训练 RandomForestRegressor (目标: log(PPS)) ...")
-        model = RandomForestRegressor(
-            n_estimators=300,
-            max_depth=18,
-            min_samples_leaf=3,
-            min_samples_split=6,
-            max_features="sqrt",
-            n_jobs=-1,
-            random_state=42,
-            verbose=0,
-        )
-        model.fit(X_train, y_train)
+        try:
+            loaded = joblib.load(model_path)
+            if isinstance(loaded, dict) and loaded.get("type") == "stacking":
+                base_models = loaded["base_models"]
+                meta_learner = loaded["meta_learner"]
+                model_names = loaded["model_names"]
+
+                class StackingWrapper:
+                    def __init__(self, base_models, meta_learner, model_names):
+                        self.base_models = base_models
+                        self.meta_learner = meta_learner
+                        self.model_names = model_names
+
+                    def predict(self, X):
+                        meta_feats = np.column_stack([
+                            m.predict(X) for m_name, m in self.base_models.items()
+                        ])
+                        return self.meta_learner.predict(meta_feats)
+
+                model = StackingWrapper(base_models, meta_learner, model_names)
+                print(f"[INFO] Stacking 模型从 model.pkl 加载成功")
+            else:
+                model = loaded
+                print(f"[INFO] 单模型加载成功: {type(model).__name__}")
+        except Exception as e:
+            print(f"[INFO] 加载 model.pkl 失败 ({e})，重新训练")
+
+    # 如果没有加载到模型，重新训练
+    if model is None:
+        print("[INFO] 训练模型...")
+        try:
+            import xgboost as xgb
+            print("[INFO] 训练 XGBoost (目标: log(PPS)) ...")
+            model = xgb.XGBRegressor(
+                n_estimators=1000, learning_rate=0.05, max_depth=6,
+                subsample=0.8, colsample_bytree=0.8,
+                early_stopping_rounds=50, eval_metric="rmse",
+                n_jobs=-1, random_state=RANDOM_STATE, verbosity=0
+            )
+            model.fit(X_train, y_train, eval_set=[(X_train, y_train)], verbose=False)
+        except ImportError:
+            print("[INFO] xgboost 未安装，训练 RandomForest ...")
+            model = RandomForestRegressor(
+                n_estimators=500, max_depth=20, min_samples_leaf=2,
+                min_samples_split=4, n_jobs=-1, random_state=RANDOM_STATE
+            )
+            model.fit(X_train, y_train)
 
     # ================================================================
     # 预测并还原为总价
