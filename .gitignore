@@ -1,0 +1,30 @@
+# 模型文件 (775MB)
+model.pkl
+*.pkl
+*.joblib
+
+# 数据文件
+train.csv
+test.csv
+*.csv
+
+# 压缩包
+*.zip
+*.tar.gz
+*.rar
+
+# EDA 生成的图片
+*.png
+*.jpg
+*.jpeg
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 环境
+.env
+.venv/
+venv/
