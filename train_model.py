@@ -40,7 +40,7 @@ from sklearn.ensemble import (
 )
 from sklearn.linear_model import Ridge, ElasticNet
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import KFold, train_test_split, RandomizedSearchCV
 from sklearn.preprocessing import OneHotEncoder
 import joblib
 
@@ -58,6 +58,10 @@ PPS_LOWER_PERCENTILE = 0.5   # PPS 下侧裁剪
 PPS_UPPER_PERCENTILE = 99.5  # PPS 上侧裁剪
 AREA_LOWER_PERCENTILE = 0.5  # area_sqm winsorization 下侧
 AREA_UPPER_PERCENTILE = 99.5 # area_sqm winsorization 上侧
+
+# 超参数调优结果缓存（由 tune_hyperparameters 填充）
+TUNED_CONFIGS = {}
+RUN_HYPERPARAMETER_TUNING = False  # 设为 True 开启超参数调优（较慢）
 
 
 # ============================================================
@@ -182,13 +186,13 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     else:
         print("  无可疑记录删除")
 
-    # 3. area_sqm winsorization (双侧裁剪)
+    # 3. area_sqm winsorization (硬限制 floor=10, ceil=1000)
     area = pd.to_numeric(df["area_sqm"], errors="coerce")
-    area_lower = np.percentile(area.dropna(), AREA_LOWER_PERCENTILE)
-    area_upper = np.percentile(area.dropna(), AREA_UPPER_PERCENTILE)
-    n_area_clipped = ((area < area_lower) | (area > area_upper)).sum()
-    df["area_sqm"] = np.clip(area, area_lower, area_upper)
-    print(f"  area_sqm winsorization [{area_lower:.1f}, {area_upper:.1f}]: 裁剪 {n_area_clipped} 条")
+    AREA_FLOOR = 10.0
+    AREA_CEIL = 1000.0
+    n_area_clipped = ((area < AREA_FLOOR) | (area > AREA_CEIL)).sum()
+    df["area_sqm"] = np.clip(area, AREA_FLOOR, AREA_CEIL)
+    print(f"  area_sqm winsorization [{AREA_FLOOR:.1f}, {AREA_CEIL:.1f}]: 裁剪 {n_area_clipped} 条")
 
     print(f"  清洗后数据集形状: {df.shape}")
     return df
@@ -320,6 +324,10 @@ def compute_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
     result["log_total_rooms"] = np.log(result["total_rooms"] + 1e-6)
     result["log_area_per_bedroom"] = np.log(result["area_per_bedroom"] + 1e-6)
 
+    # ---- 新的交互特征 ----
+    result["rooms_x_log_area"] = result["total_rooms"] * result["log_area_sqm"]
+    result["bedroom_ratio_x_area"] = result["bedroom_ratio"] * area
+
     return result
 
 
@@ -396,27 +404,19 @@ def kfold_target_encode(df, col, target, smooth=1, n_folds=N_FOLDS):
     return encoded
 
 
-def _get_district_rooms_interaction(df):
-    """district × total_rooms 交互特征"""
+def _get_district_rooms_interaction(df, district_target=None):
+    """district × total_rooms 交互特征（使用目标编码代替 LabelEncoder）"""
     bedrooms = pd.to_numeric(df["bedrooms"], errors="coerce").fillna(2)
     livingrooms = pd.to_numeric(df["livingrooms"], errors="coerce").fillna(1)
     total_rooms = bedrooms + livingrooms
-    district_clean = df["district"].astype(str).str.strip().str.replace("二手房", "", regex=False)
-    # 使用 district 的数值编码与 total_rooms 相乘
-    from sklearn.preprocessing import LabelEncoder
-    le = LabelEncoder()
-    district_num = le.fit_transform(district_clean)
-    return district_num * total_rooms
+    return district_target * total_rooms
 
 
-def _get_build_year_district_interaction(df):
-    """build_year × district 交互特征"""
+def _get_build_year_district_interaction(df, district_target=None):
+    """build_year × district 交互特征（使用目标编码代替 LabelEncoder）"""
     build_year = pd.to_numeric(df["build_year"], errors="coerce").fillna(2000)
-    district_clean = df["district"].astype(str).str.strip().str.replace("二手房", "", regex=False)
-    from sklearn.preprocessing import LabelEncoder
-    le = LabelEncoder()
-    district_num = le.fit_transform(district_clean)
-    return district_num * build_year
+    house_age = (2024 - build_year).clip(0, 100)
+    return district_target * house_age
 
 
 def build_features(df, target=None, is_train=True, ref_freq=None, ref_target=None, medians_ref=None):
@@ -438,6 +438,7 @@ def build_features(df, target=None, is_train=True, ref_freq=None, ref_target=Non
         subdistrict_enc, _ = frequency_encode(df, df, "subdistrict")
         district_enc, _ = target_encode(df, df, "district", target, smooth=1)
         subdistrict_target_enc, _ = target_encode(df, df, "subdistrict", target, smooth=10)
+        community_target_enc, _ = target_encode(df, df, "community", target, smooth=50)
         ref_freq = {
             "community": df["community"].value_counts().to_dict(),
             "subdistrict": df["subdistrict"].value_counts().to_dict(),
@@ -449,7 +450,10 @@ def build_features(df, target=None, is_train=True, ref_freq=None, ref_target=Non
         agg_s = df.groupby("subdistrict")[target.name].agg(["mean", "count"])
         smoothed_s = (agg_s["mean"] * agg_s["count"] + global_mean * 10) / (agg_s["count"] + 10)
         ref_target_subdistrict = smoothed_s.to_dict()
-        ref_target = {"district": ref_target_district, "subdistrict": ref_target_subdistrict}
+        agg_c = df.groupby("community")[target.name].agg(["mean", "count"])
+        smoothed_c = (agg_c["mean"] * agg_c["count"] + global_mean * 50) / (agg_c["count"] + 50)
+        ref_target_community = smoothed_c.to_dict()
+        ref_target = {"district": ref_target_district, "subdistrict": ref_target_subdistrict, "community": ref_target_community}
     else:
         freq_c = ref_freq.get("community", {})
         freq_s = ref_freq.get("subdistrict", {})
@@ -459,6 +463,9 @@ def build_features(df, target=None, is_train=True, ref_freq=None, ref_target=Non
             target.mean() if target is not None else 1.0
         ).values
         subdistrict_target_enc = df["subdistrict"].map(ref_target.get("subdistrict", {})).fillna(
+            target.mean() if target is not None else 1.0
+        ).values
+        community_target_enc = df["community"].map(ref_target.get("community", {})).fillna(
             target.mean() if target is not None else 1.0
         ).values
 
@@ -473,9 +480,9 @@ def build_features(df, target=None, is_train=True, ref_freq=None, ref_target=Non
     else:
         numeric_data = numeric_data.fillna(medians_ref if medians_ref is not None else numeric_data.median())
 
-    # 交互特征
-    district_rooms = _get_district_rooms_interaction(df)
-    by_district = _get_build_year_district_interaction(df)
+    # 交互特征（使用目标编码 district 值）
+    district_rooms = _get_district_rooms_interaction(df, district_enc)
+    by_district = _get_build_year_district_interaction(df, district_enc)
 
     X = np.column_stack(
         [
@@ -489,6 +496,7 @@ def build_features(df, target=None, is_train=True, ref_freq=None, ref_target=Non
             subdistrict_enc,
             district_enc,
             subdistrict_target_enc,
+            community_target_enc,
             district_rooms,
             by_district,
         ]
@@ -524,10 +532,6 @@ def build_features_leakproof(df, target, train_idx, val_idx, ref_freq=None, medi
     ratio_feats = compute_ratio_features(df)
     villa_feats = detect_villa(df)
     by_feats = bucket_build_year(df)
-
-    # 交互特征
-    district_rooms = _get_district_rooms_interaction(df)
-    by_district = _get_build_year_district_interaction(df)
 
     # ---- 数值特征 ----
     numeric_cols = ["bedrooms", "livingrooms", "area_sqm", "total_floor", "build_year"]
@@ -577,6 +581,18 @@ def build_features_leakproof(df, target, train_idx, val_idx, ref_freq=None, medi
     subd_enc[train_idx] = df_train["subdistrict"].map(map_s).fillna(global_mean).values
     subd_enc[val_idx] = df_val["subdistrict"].map(map_s).fillna(global_mean).values
 
+    # community 目标编码（高平滑，防止 9648 个类别的过拟合）
+    agg_c = train_with_target.groupby("community")["_target_"].agg(["mean", "count"])
+    smoothed_c = (agg_c["mean"] * agg_c["count"] + global_mean * 50) / (agg_c["count"] + 50)
+    map_c = smoothed_c.to_dict()
+    community_target_enc = np.zeros(len(df))
+    community_target_enc[train_idx] = df_train["community"].map(map_c).fillna(global_mean).values
+    community_target_enc[val_idx] = df_val["community"].map(map_c).fillna(global_mean).values
+
+    # ---- 交互特征（使用目标编码 district 值）----
+    district_rooms = _get_district_rooms_interaction(df, district_enc)
+    by_district = _get_build_year_district_interaction(df, district_enc)
+
     # ---- floor_region OneHot ----
     floor_series = df["floor_region"].fillna("未知").astype(str)
     all_floor = floor_series.unique()
@@ -596,6 +612,7 @@ def build_features_leakproof(df, target, train_idx, val_idx, ref_freq=None, medi
             subdistrict_enc,
             district_enc,
             subd_enc,
+            community_target_enc,
             district_rooms,
             by_district,
         ]
@@ -610,13 +627,26 @@ def build_features_leakproof(df, target, train_idx, val_idx, ref_freq=None, medi
 # ============================================================
 
 def compute_pps_target(y_house_price, area_sqm):
-    """计算 PPS 目标（双侧裁剪 + log）"""
+    """计算 PPS 目标（双侧裁剪 + log + 极端值移除）"""
     pps = y_house_price / area_sqm
-    lower = np.percentile(pps, PPS_LOWER_PERCENTILE)
-    upper = np.percentile(pps, PPS_UPPER_PERCENTILE)
-    pps_clipped = np.clip(pps, lower, upper)
+
+    # 移除极端 PPS 值（0.1% / 99.9% 双端过滤）
+    pps_lower_extreme = np.percentile(pps, 0.1)
+    pps_upper_extreme = np.percentile(pps, 99.9)
+    pps_filtered = np.where(
+        (pps >= pps_lower_extreme) & (pps <= pps_upper_extreme),
+        pps, np.nan
+    )
+
+    # 裁剪（使用配置的百分位）
+    lower = np.nanpercentile(pps_filtered, PPS_LOWER_PERCENTILE)
+    upper = np.nanpercentile(pps_filtered, PPS_UPPER_PERCENTILE)
+    pps_clipped = np.clip(pps_filtered, lower, upper)
     y_pps_log = np.log(pps_clipped)
-    return y_pps_log, lower, upper
+
+    # 返回过滤后的有效数据索引
+    valid_mask = ~np.isnan(pps_filtered)
+    return y_pps_log, lower, upper, valid_mask
 
 
 def train_and_select(df, y_house_price, area_sqm):
@@ -630,9 +660,12 @@ def train_and_select(df, y_house_price, area_sqm):
     print("=" * 60)
 
     # ---- 计算 PPS 目标 ----
-    y_pps_log, pps_lower, pps_upper = compute_pps_target(y_house_price, area_sqm)
+    y_pps_log, pps_lower, pps_upper, valid_mask = compute_pps_target(y_house_price, area_sqm)
     print(f"  PPS 裁剪范围: [{pps_lower:.2f}, {pps_upper:.2f}] 万元/平米")
-    print(f"  log(PPS) 偏度: {pd.Series(y_pps_log).skew():.2f}")
+    n_removed = (~valid_mask).sum()
+    if n_removed > 0:
+        print(f"  移除 {n_removed} 条极端 PPS 样本 (0.1%/99.9% 双端过滤)")
+    print(f"  log(PPS) 偏度: {pd.Series(y_pps_log[valid_mask]).skew():.2f}")
 
     # ---- 先做特征拆分 ----
     # 使用 train_test_split 分割 df 索引
@@ -640,6 +673,11 @@ def train_and_select(df, y_house_price, area_sqm):
     train_idx, val_idx = train_test_split(
         indices, test_size=0.2, random_state=RANDOM_STATE
     )
+
+    # 过滤掉极端 PPS 样本
+    valid_indices = indices[valid_mask]
+    train_idx = np.intersect1d(train_idx, valid_indices)
+    val_idx = np.intersect1d(val_idx, valid_indices)
 
     # 构建无泄露特征
     target_series = pd.Series(y_pps_log, name="log_pps")
@@ -691,40 +729,47 @@ def train_and_select(df, y_house_price, area_sqm):
         )),
     ]
 
-    # ---- XGBoost 模型 ----
-    try:
-        import xgboost as xgb
-        models += [
-            ("XGB(lr=0.05,n=1000,md=6)+PPS", xgb.XGBRegressor(
-                n_estimators=1000, learning_rate=0.05, max_depth=6,
-                subsample=0.8, colsample_bytree=0.8,
-                early_stopping_rounds=50, eval_metric="rmse",
-                n_jobs=-1, random_state=RANDOM_STATE, verbosity=0
-            )),
-            ("XGB(lr=0.03,n=1500,md=5)+PPS", xgb.XGBRegressor(
-                n_estimators=1500, learning_rate=0.03, max_depth=5,
-                subsample=0.8, colsample_bytree=0.8,
-                early_stopping_rounds=50, eval_metric="rmse",
-                n_jobs=-1, random_state=RANDOM_STATE, verbosity=0
-            )),
-            ("XGB(lr=0.1,n=500,md=7)+PPS", xgb.XGBRegressor(
-                n_estimators=500, learning_rate=0.1, max_depth=7,
-                subsample=0.8, colsample_bytree=0.8,
-                n_jobs=-1, random_state=RANDOM_STATE, verbosity=0
-            )),
-        ]
-        has_xgboost = True
-    except ImportError:
-        print("  [注意] xgboost 未安装，跳过 XGBoost 模型")
-        has_xgboost = False
+    # ---- 更强的 HistGBR 配置 ----
+    models += [
+        ("HistGBR(d=6,l2=1,ls=10)+PPS", HistGradientBoostingRegressor(
+            max_depth=6, l2_regularization=1.0, min_samples_leaf=10,
+            random_state=RANDOM_STATE
+        )),
+        ("HistGBR(d=8,l2=5,ls=20)+PPS", HistGradientBoostingRegressor(
+            max_depth=8, l2_regularization=5.0, min_samples_leaf=20,
+            learning_rate=0.1, random_state=RANDOM_STATE
+        )),
+        ("HistGBR(d=10,l2=10,ls=5)+PPS", HistGradientBoostingRegressor(
+            max_depth=10, l2_regularization=10.0, min_samples_leaf=5,
+            learning_rate=0.05, max_iter=500, random_state=RANDOM_STATE
+        )),
+    ]
+
+    # ---- Tuned 模型配置（若调优已运行）----
+    global TUNED_CONFIGS
+    if "HistGBR" in TUNED_CONFIGS:
+        tc = TUNED_CONFIGS["HistGBR"]
+        models.append((
+            f"HistGBR(TUNED)+PPS",
+            HistGradientBoostingRegressor(**tc, random_state=RANDOM_STATE)
+        ))
+    if "GBR" in TUNED_CONFIGS:
+        tc = TUNED_CONFIGS["GBR"]
+        models.append((
+            f"GBR(TUNED)+PPS",
+            GradientBoostingRegressor(**tc, random_state=RANDOM_STATE)
+        ))
+    if "RF" in TUNED_CONFIGS:
+        tc = TUNED_CONFIGS["RF"]
+        models.append((
+            f"RF(TUNED)+PPS",
+            RandomForestRegressor(**tc, n_jobs=-1, random_state=RANDOM_STATE)
+        ))
 
     # ---- 训练与评估 ----
     for name, model_cls in models:
         m = deepcopy(model_cls)
-        if "XGB" in name and has_xgboost and hasattr(model_cls, 'early_stopping_rounds') and model_cls.early_stopping_rounds is not None and model_cls.early_stopping_rounds > 0:
-            m.fit(X_train, y_train_l, eval_set=[(X_val, y_val_l)], verbose=False)
-        else:
-            m.fit(X_train, y_train_l)
+        m.fit(X_train, y_train_l)
         pred_log = m.predict(X_val)
         pred_price = np.exp(pred_log) * area_val
         rmse = np.sqrt(mean_squared_error(hp_val, pred_price))
@@ -760,9 +805,19 @@ def cross_validate_best(df, y_house_price, area_sqm, model, name):
     print("5. 交叉验证 (log(PPS) + house_price 评估, 内置无泄露编码)")
     print("=" * 60)
 
-    y_pps_log, pps_lower, pps_upper = compute_pps_target(y_house_price, area_sqm)
+    y_pps_log, pps_lower, pps_upper, valid_mask = compute_pps_target(y_house_price, area_sqm)
     target_series = pd.Series(y_pps_log, name="log_pps")
     print(f"  PPS 裁剪范围: [{pps_lower:.2f}, {pps_upper:.2f}]")
+    n_removed = (~valid_mask).sum()
+    if n_removed > 0:
+        print(f"  移除 {n_removed} 条极端 PPS 样本")
+
+    # 过滤有效样本
+    df = df[valid_mask].reset_index(drop=True)
+    area_sqm = area_sqm[valid_mask]
+    y_house_price = y_house_price[valid_mask]
+    y_pps_log = y_pps_log[valid_mask]
+    target_series = pd.Series(y_pps_log, name="log_pps")
 
     kf = KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     rmse_scores = []
@@ -818,11 +873,21 @@ def train_stacking_ensemble(df, y_house_price, area_sqm):
     print("5b. Stacking 集成 (RF + XGBoost + GBR → Ridge)")
     print("=" * 60)
 
-    y_pps_log, pps_lower, pps_upper = compute_pps_target(y_house_price, area_sqm)
+    y_pps_log, pps_lower, pps_upper, valid_mask = compute_pps_target(y_house_price, area_sqm)
     target_series = pd.Series(y_pps_log, name="log_pps")
     print(f"  PPS 裁剪范围: [{pps_lower:.2f}, {pps_upper:.2f}]")
+    n_removed = (~valid_mask).sum()
+    if n_removed > 0:
+        print(f"  移除 {n_removed} 条极端 PPS 样本")
 
-    # Base models
+    # 过滤有效样本
+    df = df[valid_mask].reset_index(drop=True)
+    area_sqm = area_sqm[valid_mask]
+    y_house_price = y_house_price[valid_mask]
+    y_pps_log = y_pps_log[valid_mask]
+    target_series = pd.Series(y_pps_log, name="log_pps")
+
+    # Base models (sklearn-native only for Codabench compatibility)
     base_models = {
         "rf": RandomForestRegressor(
             n_estimators=500, max_depth=20, min_samples_leaf=2,
@@ -832,19 +897,11 @@ def train_stacking_ensemble(df, y_house_price, area_sqm):
             n_estimators=500, learning_rate=0.05, max_depth=5,
             min_samples_leaf=10, subsample=0.8, random_state=RANDOM_STATE
         ),
+        "histgbr": HistGradientBoostingRegressor(
+            max_depth=8, l2_regularization=5.0, min_samples_leaf=20,
+            learning_rate=0.1, random_state=RANDOM_STATE
+        ),
     }
-
-    try:
-        import xgboost as xgb
-        base_models["xgb"] = xgb.XGBRegressor(
-            n_estimators=1000, learning_rate=0.05, max_depth=6,
-            subsample=0.8, colsample_bytree=0.8,
-            early_stopping_rounds=50, eval_metric="rmse",
-            n_jobs=-1, random_state=RANDOM_STATE, verbosity=0
-        )
-        has_xgb = True
-    except ImportError:
-        has_xgb = False
 
     meta_learner = Ridge(alpha=1.0, random_state=RANDOM_STATE)
 
@@ -866,10 +923,7 @@ def train_stacking_ensemble(df, y_house_price, area_sqm):
         fold_models = []
         for i, (m_name, m_cls) in enumerate(base_models.items()):
             m = deepcopy(m_cls)
-            if m_name == "xgb" and has_xgb and hasattr(m_cls, 'early_stopping_rounds') and m_cls.early_stopping_rounds is not None:
-                m.fit(X_tr, y_tr, eval_set=[(X_vl, y_vl)], verbose=False)
-            else:
-                m.fit(X_tr, y_tr)
+            m.fit(X_tr, y_tr)
             oof_preds[val_idx, i] = m.predict(X_vl)
             fold_models.append(m)
 
@@ -906,6 +960,134 @@ def train_stacking_ensemble(df, y_house_price, area_sqm):
     }
 
     return stacking_model, rmse
+
+
+# ============================================================
+# 5c. 超参数调优 (RandomizedSearchCV)
+# ============================================================
+
+def tune_hyperparameters(df, y_house_price, area_sqm):
+    """
+    对 HistGBR, GBR, RF 进行 RandomizedSearchCV 超参数搜索。
+    使用内置无泄露目标编码的 K-Fold 评估。
+    返回最佳参数 dict。
+    """
+    print("\n" + "=" * 60)
+    print("5c. 超参数调优 (RandomizedSearchCV)")
+    print("=" * 60)
+
+    y_pps_log, pps_lower, pps_upper, valid_mask = compute_pps_target(y_house_price, area_sqm)
+    target_series = pd.Series(y_pps_log, name="log_pps")
+
+    # 过滤有效样本
+    df = df[valid_mask].reset_index(drop=True)
+    area_sqm = area_sqm[valid_mask]
+    y_house_price = y_house_price[valid_mask]
+    y_pps_log = y_pps_log[valid_mask]
+
+    # 构建全量特征（用于 CV 内的无泄露目标编码）
+    # 注意：这里用 full feature build + KFold 手动处理
+
+    tuned_configs = {}
+
+    # ---- HistGBR 调优 ----
+    print("\n--- HistGradientBoostingRegressor 调优 ---")
+    hgbr_param_dist = {
+        "max_depth": [4, 6, 8, 10],
+        "l2_regularization": [0.0, 1.0, 5.0, 10.0],
+        "min_samples_leaf": [5, 10, 20, 50],
+        "learning_rate": [0.01, 0.05, 0.1, 0.2],
+    }
+    hgbr_best = _tune_single_model(
+        df, y_pps_log, target_series,
+        HistGradientBoostingRegressor(random_state=RANDOM_STATE),
+        hgbr_param_dist, "HistGBR", n_iter=10
+    )
+    tuned_configs["HistGBR"] = hgbr_best
+    print(f"  HistGBR 最佳参数: {hgbr_best}")
+
+    # ---- GBR 调优 ----
+    print("\n--- GradientBoostingRegressor 调优 ---")
+    gbr_param_dist = {
+        "n_estimators": [300, 600, 900, 1500],
+        "learning_rate": [0.01, 0.05, 0.1, 0.2],
+        "max_depth": [3, 4, 5, 7],
+        "subsample": [0.7, 0.8, 0.9, 1.0],
+    }
+    gbr_best = _tune_single_model(
+        df, y_pps_log, target_series,
+        GradientBoostingRegressor(random_state=RANDOM_STATE),
+        gbr_param_dist, "GBR", n_iter=10
+    )
+    tuned_configs["GBR"] = gbr_best
+    print(f"  GBR 最佳参数: {gbr_best}")
+
+    # ---- RF 调优 ----
+    print("\n--- RandomForestRegressor 调优 ---")
+    rf_param_dist = {
+        "n_estimators": [300, 400, 600, 800],
+        "max_depth": [15, 20, 25, 30],
+        "min_samples_leaf": [1, 2, 3, 5],
+    }
+    rf_best = _tune_single_model(
+        df, y_pps_log, target_series,
+        RandomForestRegressor(n_jobs=-1, random_state=RANDOM_STATE),
+        rf_param_dist, "RF", n_iter=6
+    )
+    tuned_configs["RF"] = rf_best
+    print(f"  RF 最佳参数: {rf_best}")
+
+    return tuned_configs
+
+
+def _tune_single_model(df, y_pps_log, target_series, base_model, param_dist, name, n_iter=15):
+    """
+    对单个模型进行超参数搜索（使用 K-Fold + 无泄露特征构建）。
+    """
+    from sklearn.metrics import make_scorer
+
+    kf = KFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+
+    param_list = []
+    score_list = []
+
+    # 从 param_dist 中随机采样 n_iter 组参数
+    all_param_keys = list(param_dist.keys())
+    rng = np.random.RandomState(RANDOM_STATE)
+
+    for i in range(n_iter):
+        params = {}
+        for k in all_param_keys:
+            choices = param_dist[k]
+            params[k] = choices[rng.randint(len(choices))]
+        param_list.append(params)
+
+    # 对每组参数做 3-Fold CV
+    for i, params in enumerate(param_list):
+        fold_scores = []
+        for train_idx, val_idx in kf.split(df):
+            X_tr, X_vl, _ = build_features_leakproof(
+                df, target_series, train_idx, val_idx
+            )
+            y_tr = y_pps_log[train_idx]
+            y_vl = y_pps_log[val_idx]
+
+            m = deepcopy(base_model)
+            m.set_params(**params)
+            m.fit(X_tr, y_tr)
+
+            pred_log = m.predict(X_vl)
+            # 评估使用 log(PPS) 的 RMSE
+            fold_rmse = np.sqrt(mean_squared_error(y_vl, pred_log))
+            fold_scores.append(fold_rmse)
+
+        avg_rmse = np.mean(fold_scores)
+        score_list.append(avg_rmse)
+        if (i + 1) % 5 == 0 or i == 0:
+            print(f"    [{name}] 参数组 {i+1}/{n_iter}: CV RMSE(log) = {avg_rmse:.4f}")
+
+    best_idx = np.argmin(score_list)
+    return param_list[best_idx]
 
 
 # ============================================================
@@ -946,12 +1128,18 @@ def analyze_feature_importance(model, feature_names):
 # ============================================================
 
 def train_final_model(df, y_house_price, area_sqm, best_estimator, use_stacking=False):
-    """在全部数据上重新训练并保存模型"""
+    """在全部数据上重新训练并保存模型（数据应已过滤无效 PPS）"""
     print("\n" + "=" * 60)
     print("7. 全量训练并保存模型 (目标: log(PPS))")
     print("=" * 60)
 
-    y_pps_log, pps_lower, pps_upper = compute_pps_target(y_house_price, area_sqm)
+    # 计算 PPS 目标（不做额外过滤——数据已经过滤过了）
+    pps = y_house_price / area_sqm
+    pps_lower = np.percentile(pps, PPS_LOWER_PERCENTILE)
+    pps_upper = np.percentile(pps, PPS_UPPER_PERCENTILE)
+    pps_clipped = np.clip(pps, pps_lower, pps_upper)
+    y_pps_log = np.log(pps_clipped)
+
     df = df.copy()
     df["log_pps"] = y_pps_log
     target_series = df["log_pps"]
@@ -973,27 +1161,14 @@ def train_final_model(df, y_house_price, area_sqm, best_estimator, use_stacking=
         full_base_models = {}
         for m_name, m_cls in base_models.items():
             m = deepcopy(m_cls)
-            if m_name == "xgb" and hasattr(m_cls, 'early_stopping_rounds') and m_cls.early_stopping_rounds is not None:
-                # 对全量训练不需要 early stopping
-                m.n_estimators = min(m.n_estimators, 500)
-                m.early_stopping_rounds = None
-                import xgboost as xgb
-                new_m = xgb.XGBRegressor(
-                    n_estimators=500, learning_rate=m.learning_rate, max_depth=m.max_depth,
-                    subsample=m.subsample, colsample_bytree=m.colsample_bytree,
-                    n_jobs=-1, random_state=RANDOM_STATE, verbosity=0
-                )
-                new_m.fit(X_full, y_pps_log)
-                full_base_models[m_name] = new_m
-            else:
-                m.fit(X_full, y_pps_log)
-                full_base_models[m_name] = m
+            m.fit(X_full, target_series.values)
+            full_base_models[m_name] = m
 
         # 用 base models 生成 meta features
         meta_features = np.column_stack([m.predict(X_full) for m_name, m in full_base_models.items()])
 
         # 训练 meta-learner
-        meta_learner.fit(meta_features, y_pps_log)
+        meta_learner.fit(meta_features, target_series.values)
 
         final_model = {
             "type": "stacking",
@@ -1017,9 +1192,7 @@ def train_final_model(df, y_house_price, area_sqm, best_estimator, use_stacking=
         if isinstance(final_model, dict):
             # Stacking dict was passed directly
             pass
-        elif hasattr(final_model, 'early_stopping_rounds'):
-            final_model.early_stopping_rounds = None
-        final_model.fit(X_full, y_pps_log)
+        final_model.fit(X_full, target_series.values)
 
         joblib.dump(final_model, MODEL_SAVE_PATH)
         print(f"  模型已保存至: {MODEL_SAVE_PATH}")
@@ -1053,10 +1226,11 @@ def main():
     print("=" * 60)
 
     # 构建特征（全量版本，用于特征名获取和后续对比）
-    y_pps_log, _, _ = compute_pps_target(df["house_price"].values.astype(float),
+    y_pps_log, _, _, valid_mask = compute_pps_target(df["house_price"].values.astype(float),
                                           pd.to_numeric(df["area_sqm"], errors="coerce").fillna(
                                               df["area_sqm"].median()).values)
     df["log_pps"] = y_pps_log
+    df = df[valid_mask].reset_index(drop=True)
     target_series = df["log_pps"]
     X, ref_freq, ref_target, medians, all_floor, _ = build_features(
         df, target_series, is_train=True
@@ -1071,6 +1245,7 @@ def main():
         "area_per_bedroom", "floor_bucket_low", "floor_bucket_mid",
         "floor_bucket_high", "floor_ratio_x_total",
         "log_area_sqm", "log_total_rooms", "log_area_per_bedroom",
+        "rooms_x_log_area", "bedroom_ratio_x_area",
     ]
     title_names = [
         "has_subway", "has_decorated", "has_elevator", "has_school",
@@ -1087,7 +1262,7 @@ def main():
         "by_2000_2010", "by_2010plus", "by_unknown",
     ]
     villa_names = ["is_villa"]
-    enc_names = ["community_freq", "subdistrict_freq", "district_target", "subdistrict_target"]
+    enc_names = ["community_freq", "subdistrict_freq", "district_target", "subdistrict_target", "community_target"]
     interaction_names = ["district_rooms_interact", "by_district_interact"]
     floor_names = [f"floor_{c}" for c in all_floor]
     feature_names = (
@@ -1098,7 +1273,27 @@ def main():
     print(f"  特征矩阵形状: {X.shape}")
     print(f"  特征数量: {X.shape[1]}")
 
-    # Step 5: 训练与选择（无泄露版本）
+    # 目标变量
+    y_house_price = df["house_price"].values.astype(float)
+    area_sqm = pd.to_numeric(df["area_sqm"], errors="coerce").fillna(
+        df["area_sqm"].median()
+    ).values
+
+    # Step 5: 超参数调优（可选，默认关闭以节省时间）
+    global TUNED_CONFIGS
+    if RUN_HYPERPARAMETER_TUNING:
+        print("\n" + "=" * 60)
+        print("4. 超参数调优")
+        print("=" * 60)
+        try:
+            TUNED_CONFIGS = tune_hyperparameters(df, y_house_price, area_sqm)
+            print(f"\n  调优完成，TUNED_CONFIGS = {TUNED_CONFIGS}")
+        except Exception as e:
+            print(f"  调优跳过 ({e})，使用默认配置")
+    else:
+        print("\n[INFO] 超参数调优已跳过 (RUN_HYPERPARAMETER_TUNING=False)")
+
+    # Step 6: 训练与选择（无泄露版本）
     y_house_price = df["house_price"].values.astype(float)
     area_sqm = pd.to_numeric(df["area_sqm"], errors="coerce").fillna(
         df["area_sqm"].median()
@@ -1124,11 +1319,9 @@ def main():
 
     # Step 8: 特征重要性（对最优单模型）
     # 用全量数据重训练以获取 feature_importances_
-    y_pps_log_full, _, _ = compute_pps_target(y_house_price, area_sqm)
     best_model_full = deepcopy(best_result["model"])
-    if hasattr(best_model_full, 'early_stopping_rounds'):
-        best_model_full.early_stopping_rounds = None
-    best_model_full.fit(X, y_pps_log_full)
+    # 使用 df 中的 log_pps（已过滤 NaN）
+    best_model_full.fit(X, df["log_pps"].values)
     analyze_feature_importance(best_model_full, feature_names)
 
     # Step 9: 全量训练并保存

@@ -13,7 +13,7 @@
 模型: 优先加载预训练 model.pkl / model_stacking.pkl
       若无预训练模型则训练 RandomForestRegressor
 
-依赖: pandas, numpy, scikit-learn, xgboost (可选)
+依赖: pandas, numpy, scikit-learn
 """
 
 import argparse
@@ -24,9 +24,9 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 from copy import deepcopy
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge
-from sklearn.preprocessing import OneHotEncoder, LabelEncoder
+from sklearn.preprocessing import OneHotEncoder
 import joblib
 
 warnings.filterwarnings("ignore")
@@ -34,8 +34,6 @@ warnings.filterwarnings("ignore")
 RANDOM_STATE = 42
 PPS_LOWER_PERCENTILE = 0.5
 PPS_UPPER_PERCENTILE = 99.5
-AREA_LOWER_PERCENTILE = 0.5
-AREA_UPPER_PERCENTILE = 99.5
 
 # ============================================================
 # 1. 特征工程函数（与 train_model.py 保持同步）
@@ -161,6 +159,10 @@ def _compute_ratio_features(df: pd.DataFrame) -> pd.DataFrame:
     result["log_total_rooms"] = np.log(result["total_rooms"] + 1e-6)
     result["log_area_per_bedroom"] = np.log(result["area_per_bedroom"] + 1e-6)
 
+    # ---- 新的交互特征 ----
+    result["rooms_x_log_area"] = result["total_rooms"] * result["log_area_sqm"]
+    result["bedroom_ratio_x_area"] = result["bedroom_ratio"] * area
+
     return result
 
 
@@ -207,28 +209,21 @@ def _target_encode(train: pd.DataFrame, test: pd.DataFrame,
     return train_enc.values, test_enc.values
 
 
-def _get_interaction_features(df_train, df_test):
-    """计算交互特征: district_rooms, by_district"""
-    # district × total_rooms
-    le_d = LabelEncoder()
-    district_all = pd.concat([
-        df_train["district"].astype(str).str.strip().str.replace("二手房", "", regex=False),
-        df_test["district"].astype(str).str.strip().str.replace("二手房", "", regex=False),
-    ])
-    le_d.fit(district_all)
-
-    for df, name in [(df_train, "train"), (df_test, "test")]:
+def _get_interaction_features(df_train, df_test, district_train_enc, district_test_enc):
+    """计算交互特征: district_target×total_rooms, district_target×house_age"""
+    # district_target × total_rooms
+    for df, name, d_enc in [(df_train, "train", district_train_enc), (df_test, "test", district_test_enc)]:
         bedrooms = pd.to_numeric(df["bedrooms"], errors="coerce").fillna(2)
         livingrooms = pd.to_numeric(df["livingrooms"], errors="coerce").fillna(1)
         total_rooms = bedrooms + livingrooms
-        district_clean = df["district"].astype(str).str.strip().str.replace("二手房", "", regex=False)
-        district_num = le_d.transform(district_clean)
+        build_year = pd.to_numeric(df["build_year"], errors="coerce").fillna(2000)
+        house_age = (2024 - build_year).clip(0, 100)
         if name == "train":
-            train_dr = district_num * total_rooms
-            train_by = district_num * pd.to_numeric(df["build_year"], errors="coerce").fillna(2000)
+            train_dr = d_enc * total_rooms
+            train_by = d_enc * house_age
         else:
-            test_dr = district_num * total_rooms
-            test_by = district_num * pd.to_numeric(df["build_year"], errors="coerce").fillna(2000)
+            test_dr = d_enc * total_rooms
+            test_by = d_enc * house_age
 
     return (train_dr.values, train_by.values), (test_dr.values, test_by.values)
 
@@ -269,23 +264,31 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
         print(f"[INFO] 删除 {suspicious.sum()} 条可疑记录 (bedrooms==1 & area_sqm>200)")
         train_df = train_df[~suspicious].reset_index(drop=True)
 
-    # 3. area_sqm winsorization
+    # 3. area_sqm winsorization (硬限制 floor=10, ceil=1000)
     area_train = pd.to_numeric(train_df["area_sqm"], errors="coerce")
-    area_lower = np.percentile(area_train.dropna(), AREA_LOWER_PERCENTILE)
-    area_upper = np.percentile(area_train.dropna(), AREA_UPPER_PERCENTILE)
-    train_df["area_sqm"] = np.clip(area_train, area_lower, area_upper)
+    AREA_FLOOR = 10.0
+    AREA_CEIL = 1000.0
+    train_df["area_sqm"] = np.clip(area_train, AREA_FLOOR, AREA_CEIL)
     test_df["area_sqm"] = np.clip(
-        pd.to_numeric(test_df["area_sqm"], errors="coerce"), area_lower, area_upper
+        pd.to_numeric(test_df["area_sqm"], errors="coerce"), AREA_FLOOR, AREA_CEIL
     )
-    test_area = np.clip(test_area, area_lower, area_upper)
+    test_area = np.clip(test_area, AREA_FLOOR, AREA_CEIL)
 
-    # ================================================================
-    # 计算 PPS 目标变量
-    # ================================================================
+    # 计算 PPS 并移除极端值
     train_pps = (
         pd.to_numeric(train_df["house_price"], errors="coerce")
         / pd.to_numeric(train_df["area_sqm"], errors="coerce")
     )
+    # 移除极端 PPS 值（0.1% / 99.9% 双端过滤）
+    pps_low_extreme = np.percentile(train_pps, 0.1)
+    pps_high_extreme = np.percentile(train_pps, 99.9)
+    pps_valid_mask = (train_pps >= pps_low_extreme) & (train_pps <= pps_high_extreme)
+    n_removed_pps = (~pps_valid_mask).sum()
+    train_df = train_df[pps_valid_mask].reset_index(drop=True)
+    train_pps = train_pps[pps_valid_mask]
+    if n_removed_pps > 0:
+        print(f"[INFO] 移除 {n_removed_pps} 条极端 PPS 样本 (0.1%/99.9% 过滤)")
+
     # 双侧裁剪
     pps_lower = np.percentile(train_pps, PPS_LOWER_PERCENTILE)
     pps_upper = np.percentile(train_pps, PPS_UPPER_PERCENTILE)
@@ -328,6 +331,11 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
         train_df, test_df, "subdistrict"
     )
 
+    # --- community 目标编码（高平滑，防止 9648 个类别的过拟合）---
+    community_target_train, community_target_test = _target_encode(
+        train_df, test_df, "community", target_series, smooth=50
+    )
+
     # --- district 目标编码 ---
     district_train_enc, district_test_enc = _target_encode(
         train_df, test_df, "district", target_series, smooth=1
@@ -339,7 +347,9 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
     )
 
     # --- 交互特征 ---
-    (train_dr, train_by), (test_dr, test_by) = _get_interaction_features(train_df, test_df)
+    (train_dr, train_by), (test_dr, test_by) = _get_interaction_features(
+        train_df, test_df, district_train_enc, district_test_enc
+    )
 
     # --- floor_region OneHot ---
     floor_region_train = train_df["floor_region"].fillna("未知").astype(str)
@@ -371,6 +381,7 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
             subdistrict_train,
             district_train_enc,
             subdistrict_target_train,
+            community_target_train,
             train_dr,
             train_by,
         ]
@@ -388,6 +399,7 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
             subdistrict_test,
             district_test_enc,
             subdistrict_target_test,
+            community_target_test,
             test_dr,
             test_by,
         ]
@@ -482,24 +494,12 @@ def predict(train_path: str, test_path: str, output_path: str) -> None:
 
     # 如果没有加载到模型，重新训练
     if model is None:
-        print("[INFO] 训练模型...")
-        try:
-            import xgboost as xgb
-            print("[INFO] 训练 XGBoost (目标: log(PPS)) ...")
-            model = xgb.XGBRegressor(
-                n_estimators=1000, learning_rate=0.05, max_depth=6,
-                subsample=0.8, colsample_bytree=0.8,
-                early_stopping_rounds=50, eval_metric="rmse",
-                n_jobs=-1, random_state=RANDOM_STATE, verbosity=0
-            )
-            model.fit(X_train, y_train, eval_set=[(X_train, y_train)], verbose=False)
-        except ImportError:
-            print("[INFO] xgboost 未安装，训练 RandomForest ...")
-            model = RandomForestRegressor(
-                n_estimators=500, max_depth=20, min_samples_leaf=2,
-                min_samples_split=4, n_jobs=-1, random_state=RANDOM_STATE
-            )
-            model.fit(X_train, y_train)
+        print("[INFO] 训练模型 (sklearn-native: HistGradientBoostingRegressor) ...")
+        model = HistGradientBoostingRegressor(
+            max_depth=8, l2_regularization=5.0, min_samples_leaf=20,
+            learning_rate=0.1, random_state=RANDOM_STATE
+        )
+        model.fit(X_train, y_train)
 
     # ================================================================
     # 预测并还原为总价
